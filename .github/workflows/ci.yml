@@ -1,0 +1,36 @@
+name: CI
+on:
+  push: {branches: [main]}
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env: {POSTGRES_USER: rag, POSTGRES_PASSWORD: rag, POSTGRES_DB: schoolrag_test}
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U rag" --health-interval 5s --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql+asyncpg://rag:rag@localhost:5432/schoolrag_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - name: Install (CPU torch first, so CI does not download CUDA)
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements-dev.txt
+      - run: python -m compileall -q app
+      - run: python -m pytest -q
+      - name: Migrations produce SQL offline (catches broken revisions)
+        run: DATABASE_URL=postgresql+asyncpg://x@localhost/x JWT_SECRET=x alembic upgrade head --sql > /dev/null
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: docker-compose file is valid
+        run: |
+          cp .env.example .env
+          POSTGRES_PASSWORD=x FLOWER_PASSWORD=x GRAFANA_PASSWORD=x docker compose config -q

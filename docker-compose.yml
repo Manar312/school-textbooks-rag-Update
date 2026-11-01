@@ -1,0 +1,145 @@
+# Production stack. Only nginx is public; every admin UI (Grafana, Prometheus, Flower) listens on 127.0.0.1
+# and is reached through an SSH tunnel:  ssh -L 3000:localhost:3000 -L 5555:localhost:5555 user@server
+# NEVER run `docker compose down -v` : it deletes the volumes (database, vectors, uploaded books).
+
+x-app: &app
+  build: .
+  image: school-rag:latest
+  env_file: .env
+  restart: unless-stopped
+  environment: &app-env
+    DATABASE_URL: postgresql+asyncpg://rag:${POSTGRES_PASSWORD}@postgres:5432/schoolrag
+    REDIS_URL: redis://redis:6379/0
+    QDRANT_URL: http://qdrant:6333
+    STORAGE_DIR: /data/storage
+    PROMETHEUS_MULTIPROC_DIR: /tmp/prom
+  depends_on: &app-deps
+    postgres: {condition: service_healthy}
+    redis: {condition: service_healthy}
+    qdrant: {condition: service_started}
+  volumes: [storage:/data/storage, hf:/data/hf]
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: rag
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: schoolrag
+    volumes: [pg:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rag -d schoolrag"]
+      interval: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes: [redis:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    restart: unless-stopped
+    volumes: [qdrant:/qdrant/storage]
+
+  api:
+    <<: *app
+    command: ["api"]
+    environment:
+      <<: *app-env
+      API_WORKERS: ${API_WORKERS:-2}     # each worker loads the BGE models (~2GB RAM): raise only with enough memory
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health/live"]
+      interval: 15s
+      retries: 5
+      start_period: 90s
+
+  # Slow jobs (reading a whole book with the VLM). One at a time: free VLM tiers are rate limited.
+  worker:
+    <<: *app
+    command: ["celery", "-A", "app.workers.celery_app", "worker", "-l", "info", "--concurrency=1", "-Q", "ingest"]
+
+  # Small periodic jobs get their own worker so they never wait behind a 3-hour book.
+  worker-maintenance:
+    <<: *app
+    command: ["celery", "-A", "app.workers.celery_app", "worker", "-l", "info", "--concurrency=1", "-Q", "maintenance",
+              "-n", "maintenance@%h"]
+
+  # Beat = the alarm clock: sends the maintenance jobs on schedule. Exactly ONE instance, never scale it.
+  beat:
+    <<: *app
+    command: ["celery", "-A", "app.workers.celery_app", "beat", "-l", "info", "-s", "/tmp/celerybeat-schedule"]
+
+  # Flower = live view of Celery. Local only + password.
+  flower:
+    <<: *app
+    command: ["celery", "-A", "app.workers.celery_app", "flower", "--port=5555",
+              "--basic-auth=${FLOWER_USER:-admin}:${FLOWER_PASSWORD}"]
+    ports: ["127.0.0.1:5555:5555"]
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on: [api]
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./deploy/nginx/certs:/etc/nginx/certs:ro
+
+  # ----- monitoring -----
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    restart: unless-stopped
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom-data:/prometheus
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=30d"]
+    ports: ["127.0.0.1:9090:9090"]
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["127.0.0.1:3000:3000"]
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    restart: unless-stopped
+    environment:
+      DATA_SOURCE_NAME: postgresql://rag:${POSTGRES_PASSWORD}@postgres:5432/schoolrag?sslmode=disable
+    depends_on: {postgres: {condition: service_healthy}}
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.66.0
+    restart: unless-stopped
+    environment: {REDIS_ADDR: "redis://redis:6379"}
+    depends_on: {redis: {condition: service_healthy}}
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    restart: unless-stopped
+    pid: host
+    volumes: ["/:/host:ro,rslave"]
+    command: ["--path.rootfs=/host"]
+
+volumes:
+  pg:
+  redis:
+  qdrant:
+  storage:
+  hf:
+  prom-data:
+  grafana-data:

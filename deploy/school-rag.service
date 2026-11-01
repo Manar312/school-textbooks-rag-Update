@@ -1,0 +1,15 @@
+# Starts the whole stack at boot.  sudo cp deploy/school-rag.service /etc/systemd/system/ && sudo systemctl enable --now school-rag
+[Unit]
+Description=School RAG (docker compose)
+Requires=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/srv/school-rag
+ExecStart=/usr/bin/docker compose up -d
+ExecStop=/usr/bin/docker compose stop
+
+[Install]
+WantedBy=multi-user.target
